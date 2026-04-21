@@ -39,6 +39,9 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <TRTInference/InferenceEngine.h>
 
@@ -238,6 +241,11 @@ public:
 
     cudaStream_t encode_stream = (stream != nullptr) ? stream : cuda_stream_;
 
+    // Wall-clock the full H2D + kernel + D2H + sync path so the number matches
+    // what a downstream observer sees as "encoder forward took X us this tick".
+    // GPU work is captured because we sync before stopping the clock.
+    const auto t_start = std::chrono::steady_clock::now();
+
     // Transfer input data from CPU to GPU
     inference_engine_->SetInputData(input_tensor_name_, encoder_input_buffer_);
 
@@ -257,8 +265,24 @@ public:
     // Automatically populate internal token buffer after inference (GPU to CPU)
     inference_engine_->GetOutputDataAsync(output_tensor_name_, token_buffer_, encode_stream);
     cudaStreamSynchronize(encode_stream);
-    
+
+    const auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_start).count();
+    last_inference_us_.store(static_cast<std::uint64_t>(dt_us), std::memory_order_relaxed);
+
     return true;
+  }
+
+  /**
+   * @brief Micro-seconds spent in the most recent successful ``Encode()`` call.
+   *
+   * Includes CPU→GPU transfer, kernel launch (or graph launch), GPU→CPU
+   * transfer, and the final ``cudaStreamSynchronize``.  Updated atomically
+   * at the end of every ``Encode()`` with ``memory_order_relaxed``; safe to
+   * read from any thread.  Returns 0 until the first successful call.
+   */
+  std::uint64_t GetLastInferenceUs() const {
+    return last_inference_us_.load(std::memory_order_relaxed);
   }
 
   /**
@@ -408,6 +432,9 @@ private:
   // State
   bool initialized_ = false;
   bool graph_captured_ = false;
+
+  // Per-call timing (wall-clock us for the full H2D + compute + D2H + sync).
+  std::atomic<std::uint64_t> last_inference_us_{0};
 };
 
 #endif // ENCODER_HPP

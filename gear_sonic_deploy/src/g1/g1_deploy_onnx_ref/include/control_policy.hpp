@@ -31,6 +31,9 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <TRTInference/InferenceEngine.h>
 #include "robot_parameters.hpp"
@@ -248,6 +251,12 @@ public:
 
     cudaStream_t infer_stream = (stream != nullptr) ? stream : cuda_stream_;
 
+    // Wall-clock the full H2D + kernel (or CUDA-graph) + D2H + sync so the
+    // reported value matches what a downstream observer sees as "policy
+    // forward took X us this tick".  GPU work is captured because we sync
+    // before stopping the clock.
+    const auto t_start = std::chrono::steady_clock::now();
+
     // Transfer input data from CPU to GPU
     inference_engine_->SetInputData(input_tensor_name_, policy_input_buffer_);
 
@@ -267,8 +276,24 @@ public:
     // Automatically populate internal action buffer after inference (GPU to CPU)
     inference_engine_->GetOutputDataAsync(output_tensor_name_, action_buffer_, infer_stream);
     cudaStreamSynchronize(infer_stream);
-    
+
+    const auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_start).count();
+    last_inference_us_.store(static_cast<std::uint64_t>(dt_us), std::memory_order_relaxed);
+
     return true;
+  }
+
+  /**
+   * @brief Micro-seconds spent in the most recent successful ``Infer()`` call.
+   *
+   * Includes CPU→GPU transfer, kernel launch (or graph launch), GPU→CPU
+   * transfer, and the final ``cudaStreamSynchronize``.  Updated atomically
+   * at the end of every ``Infer()`` with ``memory_order_relaxed``; safe to
+   * read from any thread.  Returns 0 until the first successful call.
+   */
+  std::uint64_t GetLastInferenceUs() const {
+    return last_inference_us_.load(std::memory_order_relaxed);
   }
 
   /**
@@ -437,6 +462,9 @@ private:
   // State
   bool initialized_ = false;
   bool graph_captured_ = false;
+
+  // Per-call timing (wall-clock us for the full H2D + compute + D2H + sync).
+  std::atomic<std::uint64_t> last_inference_us_{0};
 };
 
 #endif // POLICY_ENGINE_HPP

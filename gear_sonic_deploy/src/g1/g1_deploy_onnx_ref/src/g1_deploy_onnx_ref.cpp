@@ -2552,6 +2552,13 @@ class G1Deploy {
       if (create_zmq) {
         auto zmq_handler = std::make_unique<ZMQOutputHandler>(*state_logger_, zmq_out_port, zmq_out_topic);
         std::cout << "Initialized ZMQ output interface" << std::endl;
+        // Wire up per-tick encoder/policy inference-time telemetry.  Both engines
+        // have already been constructed above (see policy_engine_ / encoder_engine_
+        // init earlier in this block); their GetLastInferenceUs() atomics are
+        // updated inside Encode() / Infer() and read during pack_combined_state.
+        // Either pointer may still be null at this point (e.g. no encoder
+        // configured); the ZMQ handler treats null as "publish 0".
+        zmq_handler->SetInferenceEngines(encoder_engine_.get(), policy_engine_.get());
         // Publish robot config so subscribers can receive it before control loop starts
         zmq_handler->publish_config();
         output_interfaces_.push_back(std::move(zmq_handler));

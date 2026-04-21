@@ -114,6 +114,8 @@
 #include "../policy_parameters.hpp"  // For isaaclab_to_mujoco, default_angles, g1_action_scale
 #include "../robot_parameters.hpp"   // For HeadingState
 #include "../utils.hpp"              // For DataBuffer
+#include "../encoder.hpp"            // For EncoderEngine::GetLastInferenceUs()
+#include "../control_policy.hpp"     // For PolicyEngine::GetLastInferenceUs()
 
 /**
  * @class ZMQOutputHandler
@@ -151,6 +153,28 @@ public:
         }
         
         type_ = OutputType::ZMQ;
+    }
+
+    /**
+     * @brief Attach (optional) inference-engine pointers so that per-tick
+     *        encoder/policy forward-pass timings can be packed into the
+     *        outgoing msgpack each tick.
+     *
+     * Safe to call before or after the engines have actually been
+     * initialised -- only the ``GetLastInferenceUs()`` getter is invoked,
+     * which returns 0 until the first successful inference.  Pass
+     * ``nullptr`` (the default) to disable either side; the corresponding
+     * ``encoder_infer_us`` / ``policy_infer_us`` field will then be sent
+     * as 0 so subscribers can still detect the schema without branching.
+     *
+     * The handler stores the raw pointers; the caller must ensure the
+     * engines outlive this handler (this is the case in g1_deploy_onnx_ref
+     * where both are members of the same owning object).
+     */
+    void SetInferenceEngines(const EncoderEngine* encoder,
+                             const PolicyEngine* policy) {
+        encoder_engine_ptr_ = encoder;
+        policy_engine_ptr_ = policy;
     }
 
     /**
@@ -243,6 +267,12 @@ private:
     msgpack::sbuffer config_sbuf_cache_;  ///< Serialised config (populated on first publish_config()).
     std::chrono::steady_clock::time_point config_last_publish_time_;
 
+    // -- Optional inference-engine handles for per-tick timing telemetry --
+    // Set via SetInferenceEngines() after engines are constructed.  Raw
+    // (non-owning) pointers; lifetime is managed by the deploy object.
+    const EncoderEngine* encoder_engine_ptr_ = nullptr;
+    const PolicyEngine* policy_engine_ptr_ = nullptr;
+
     /// Non-blocking send of [topic][msgpack payload] over the PUB socket.
     void send_zmq_message(const std::string& topic, const msgpack::sbuffer& sbuf) {
         zmq::message_t msg(topic.size() + sbuf.size());
@@ -279,9 +309,11 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading
+        // State-logger fields: 18 base + 2 optional heading + 2 inference timings
+        // (encoder_infer_us, policy_infer_us are always packed -- 0 when the
+        //  corresponding engine is absent or hasn't inferred yet.)
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
+        int num_state_fields = (has_heading_state ? 20 : 18) + 2;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -393,6 +425,16 @@ private:
             pk.pack("delta_heading");
             pk.pack(heading_state.delta_heading);
         }
+
+        // ---- Inference-time telemetry (wall-clock microseconds per tick) ----
+        // Always packed so the msgpack schema is stable; values are 0 when
+        // the corresponding engine is not wired up or has not yet run.
+        pk.pack("encoder_infer_us");
+        pk.pack(encoder_engine_ptr_ ? encoder_engine_ptr_->GetLastInferenceUs()
+                                    : static_cast<std::uint64_t>(0));
+        pk.pack("policy_infer_us");
+        pk.pack(policy_engine_ptr_ ? policy_engine_ptr_->GetLastInferenceUs()
+                                   : static_cast<std::uint64_t>(0));
 
         // ---- Visualisation fields (from output_data_map_) ----
         // Adds: base_trans_target, base_quat_target, body_q_target,
